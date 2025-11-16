@@ -1,0 +1,147 @@
+version: '3.8'
+
+# FastAPI 100 RPS - Single Host Deployment
+#
+# Usage:
+#   docker-compose -f docker-compose.100rps.yml up -d
+#   docker-compose -f docker-compose.100rps.yml logs -f api
+#   docker-compose -f docker-compose.100rps.yml down
+#
+# Test:
+#   k6 run --vus 10 --duration 60s http://localhost/api/v1/compute
+
+services:
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: fastapi-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx-100rps.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+    depends_on:
+      - api
+    networks:
+      - fastapi-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  # FastAPI application (4 workers via Gunicorn)
+  api:
+    build:
+      context: ../../../app
+      dockerfile: Dockerfile
+      args:
+        PYTHON_VERSION: "3.11"
+    image: fastapi-scale:latest
+    container_name: fastapi-api
+    environment:
+      - WORKERS=4
+      - HOST=0.0.0.0
+      - PORT=8000
+      - LOG_LEVEL=warning
+      - PYTHONOPTIMIZE=2
+      - PYTHONUNBUFFERED=1
+    command: >
+      gunicorn main:app
+      --workers 4
+      --worker-class uvicorn.workers.UvicornWorker
+      --bind 0.0.0.0:8000
+      --backlog 2048
+      --max-requests 100000
+      --max-requests-jitter 10000
+      --timeout 30
+      --graceful-timeout 30
+      --keep-alive 5
+      --worker-connections 1000
+      --access-logfile -
+      --error-logfile -
+      --log-level warning
+    networks:
+      - fastapi-net
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+        reservations:
+          cpus: '2'
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: fastapi-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus-100rps.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+    networks:
+      - fastapi-net
+    restart: unless-stopped
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: fastapi-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+    networks:
+      - fastapi-net
+    restart: unless-stopped
+
+networks:
+  fastapi-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+# Performance notes:
+# - This configuration is optimized for 100 RPS on a single host
+# - 4 workers match typical 4-core development machine
+# - Nginx acts as reverse proxy for better connection handling
+# - Prometheus + Grafana provide observability
+#
+# Expected resource usage:
+# - CPU: ~10% average
+# - Memory: ~1.5 GB total (all containers)
+# - Network: ~2.4 Mbps
+#
+# Scaling:
+# - For > 200 RPS sustained, migrate to 1k RPS configuration
+# - Or scale API service: docker-compose up -d --scale api=2
